@@ -1,0 +1,10 @@
+{
+  "name": "Screenshot Stitcher",
+  "short_name": "Stitcher",
+  "description": "Join overlapping scroll screenshots into one tall image. Runs in your browser.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#e9edf1",
+  "theme_color": "#16202b"
+}
