@@ -121,6 +121,10 @@ h2 {
   text-decoration: underline;
   cursor: pointer;
 }
+.fname { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.fname label { font-size: 14px; font-weight: 600; }
+.fname input { flex: 1 1 200px; min-width: 0; min-height: 44px; padding: 0 12px; border: 1.5px solid #16202b; border-radius: 4px; font: inherit; background: #fff; color: #16202b; }
+.fname span { font-size: 15px; color: #596675; }
 .check { display: flex; gap: 10px; align-items: flex-start; font-size: 15px; min-height: 28px; cursor: pointer; }
 .check input { width: 20px; height: 20px; margin: 2px 0 0; accent-color: #16202b; flex: none; }
 .result-head { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; justify-content: space-between; }
@@ -167,6 +171,7 @@ h2 {
 
       <h2>Options</h2>
       <label class="check" for="opt-frame"><input type="checkbox" id="opt-frame" checked><span>Keep the fixed header and footer</span></label>
+      <label class="check" for="opt-crop"><input type="checkbox" id="opt-crop" checked><span>Auto-crop to the dialog, from the green title bar to the last item</span></label>
       <label class="check" for="opt-scroll"><input type="checkbox" id="opt-scroll" checked><span>Remove scrollbar marks</span></label>
       <label class="check" for="opt-seams"><input type="checkbox" id="opt-seams" checked><span>Show seams in the preview</span></label>
       <p class="hint">Scroll less than a full screen between shots so neighbors overlap. Order does not matter, it is detected from the content. The pixel count under each shot is how far it was scrolled.</p>
@@ -177,6 +182,8 @@ h2 {
         <h2 id="h-result">Result</h2>
         <div class="row"><button class="btn" id="share" type="button" hidden>Share</button><button class="btn primary" id="save" type="button" disabled>Save PNG</button></div>
       </div>
+      <div class="fname"><label for="fname">File name</label><input id="fname" type="text" value="stitched" autocomplete="off" autocapitalize="off" spellcheck="false"><span>.png</span></div>
+      <p class="hint" id="fname-note" hidden></p>
       <p class="status" id="status" role="status" aria-live="polite">Reading screenshots</p>
       <dl class="stats">
         <div><dt>Shots used</dt><dd id="stat-shots">none</dd></div>
@@ -463,6 +470,63 @@ var Stitch = (function () {
     return { vt: vt, vb: vb, order: placed, offsets: offsets, skipped: skipped, scrollbar: scrollbar };
   }
 
+  // Auto-crop helpers. They look for the lime green title bar of the dialog.
+  function isGreen(r, g, b) {
+    return g > 150 && g - b > 70 && g - r > 15;
+  }
+
+  // First row of the title bar inside rows [0, limit) of a canvas, or -1.
+  function findTitleTop(canvas, limit) {
+    var W = canvas.width;
+    var h = Math.min(limit, canvas.height);
+    if (h < 10) return -1;
+    var d = canvas.getContext('2d').getImageData(0, 0, W, h).data;
+    var x0 = Math.floor(W * 0.15);
+    var x1 = Math.floor(W * 0.85);
+    var step = Math.max(2, Math.floor(W / 200));
+    var green = new Uint8Array(h);
+    for (var y = 0; y < h; y++) {
+      var g = 0;
+      var tot = 0;
+      for (var x = x0; x < x1; x += step) {
+        var i = (y * W + x) * 4;
+        if (isGreen(d[i], d[i + 1], d[i + 2])) g++;
+        tot++;
+      }
+      green[y] = g / tot > 0.6 ? 1 : 0;
+    }
+    // The bar must be tall: about 6.5 percent of the width, with a few gaps allowed for the title text.
+    var run = Math.max(8, Math.round(W * 0.065));
+    var count = 0;
+    for (var k = 0; k < Math.min(run, h); k++) count += green[k];
+    for (var s = 0; s + run <= h; s++) {
+      if (green[s] && count >= run * 0.85) return s;
+      count -= green[s];
+      if (s + run < h) count += green[s + run];
+    }
+    return -1;
+  }
+
+  // Last row in rows [y0, y0 + h) of a context that differs from the row's own panel color, or -1.
+  function lastInkRow(ctx, W, y0, h) {
+    if (h < 1) return -1;
+    var d = ctx.getImageData(0, y0, W, h).data;
+    var rx = Math.floor(W * 0.04);
+    var x0 = Math.floor(W * 0.06);
+    var x1 = Math.floor(W * 0.94);
+    for (var y = h - 1; y >= 0; y -= 1) {
+      var rb = y * W * 4;
+      var r0 = d[rb + rx * 4];
+      var g0 = d[rb + rx * 4 + 1];
+      var b0 = d[rb + rx * 4 + 2];
+      for (var x = x0; x < x1; x += 2) {
+        var i = rb + x * 4;
+        if (Math.abs(d[i] - r0) > 10 || Math.abs(d[i + 1] - g0) > 10 || Math.abs(d[i + 2] - b0) > 10) return y;
+      }
+    }
+    return -1;
+  }
+
   // sources[i].canvas is a drawable W by H. makeCanvas(w, h) returns a new canvas.
   function compose(sources, an, opts, makeCanvas) {
     opts = opts || {};
@@ -492,8 +556,20 @@ var Stitch = (function () {
       prevEnd = Math.max(prevEnd, o + vh);
     }
     var keep = opts.keepFrame !== false;
-    var topH = keep ? vt : 0;
-    var botH = keep ? H - vb : 0;
+    var cropTop = 0;
+    var crop = null;
+    if (opts.autoCrop) {
+      var tt0 = findTitleTop(first, vt);
+      if (tt0 >= 0) {
+        crop = { found: true, top: tt0, bottomTrim: 0 };
+        cropTop = tt0;
+        keep = true;
+      } else {
+        crop = { found: false, top: 0, bottomTrim: 0 };
+      }
+    }
+    var topH = keep ? vt - cropTop : 0;
+    var botH = keep && !(crop && crop.found) ? H - vb : 0;
     var bodyH = 0;
     segs.forEach(function (s) { bodyH += s.sh; });
     var total = topH + bodyH + botH;
@@ -501,7 +577,7 @@ var Stitch = (function () {
     var ctx = canvas.getContext('2d');
     var y = 0;
     if (topH > 0) {
-      ctx.drawImage(first, 0, 0, W, vt, 0, 0, W, vt);
+      ctx.drawImage(first, 0, cropTop, W, vt - cropTop, 0, 0, W, vt - cropTop);
       y = topH;
     }
     var seams = [];
@@ -538,20 +614,37 @@ var Stitch = (function () {
         cleaned++;
       });
     }
+    var removed0 = order.length * vh - bodyH;
+    if (crop && crop.found) {
+      // Drop the footer (done above) and any empty panel space after the last item.
+      var ink = lastInkRow(ctx, W, topH, bodyH);
+      var pad = Math.round(W * 0.012);
+      var keepBody = ink < 0 ? bodyH : Math.min(bodyH, ink + 1 + pad);
+      if (keepBody < bodyH) {
+        var newTotal = topH + keepBody;
+        var trimmed = makeCanvas(W, newTotal);
+        trimmed.getContext('2d').drawImage(canvas, 0, 0, W, newTotal, 0, 0, W, newTotal);
+        crop.bottomTrim = bodyH - keepBody;
+        canvas = trimmed;
+        total = newTotal;
+        bodyH = keepBody;
+      }
+    }
     return {
+      crop: crop,
       canvas: canvas,
       seams: seams,
       bodyTop: topH,
       bodyH: bodyH,
       total: total,
       width: W,
-      removed: order.length * vh - bodyH,
+      removed: removed0,
       gap: gap,
       cleaned: cleaned
     };
   }
 
-  return { lumaFromRGBA: lumaFromRGBA, analyze: analyze, compose: compose };
+  return { lumaFromRGBA: lumaFromRGBA, analyze: analyze, compose: compose, findTitleTop: findTitleTop, lastInkRow: lastInkRow };
 })();
 
 if (typeof module !== 'undefined' && module.exports) module.exports = Stitch;
@@ -663,6 +756,204 @@ if (typeof module !== 'undefined' && module.exports) module.exports = Example;
 
 </script>
 <script>
+// Reads the character name and score from the dialog header, to name the saved file.
+// Uses Tesseract (OCR) loaded from a CDN only when a title bar is found. Images stay on this device.
+var Namer = (function () {
+  var TESS_URL = 'https://cdn.jsdelivr.net/npm/tesseract.js@7.0.0/dist/tesseract.min.js';
+  var loading = null;
+
+  function loadTesseract() {
+    if (typeof Tesseract !== 'undefined') return Promise.resolve(Tesseract);
+    if (loading) return loading;
+    loading = new Promise(function (resolve, reject) {
+      var s = document.createElement('script');
+      s.src = TESS_URL;
+      s.async = true;
+      s.onload = function () {
+        if (typeof Tesseract !== 'undefined') resolve(Tesseract);
+        else reject(new Error('OCR library did not start'));
+      };
+      s.onerror = function () {
+        loading = null;
+        reject(new Error('OCR library could not load'));
+      };
+      document.head.appendChild(s);
+    });
+    return loading;
+  }
+
+  // Regions are fractions of the screenshot width, measured down from the top of the title bar.
+  var REGIONS = {
+    name: { x0: 0.46, x1: 0.82, y0: 0.158, y1: 0.22 },
+    score: { x0: 0.105, x1: 0.265, y0: 0.315, y1: 0.365 }
+  };
+
+  function cropRegion(src, top, r, makeCanvas) {
+    var W = src.width;
+    var sx = Math.round(W * r.x0);
+    var sw = Math.round(W * (r.x1 - r.x0));
+    var sy = top + Math.round(W * r.y0);
+    var sh = Math.round(W * (r.y1 - r.y0));
+    if (sy + sh > src.height) sh = src.height - sy;
+    if (sw < 8 || sh < 8) return null;
+    var c = makeCanvas(sw, sh);
+    c.getContext('2d').drawImage(src, sx, sy, sw, sh, 0, 0, sw, sh);
+    return c;
+  }
+
+  // The same crop at another size. Small screenshots are enlarged, large ones slightly reduced.
+  function scaled(c, f, makeCanvas) {
+    var out = makeCanvas(Math.max(1, Math.round(c.width * f)), Math.max(1, Math.round(c.height * f)));
+    var ctx = out.getContext('2d');
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(c, 0, 0, c.width, c.height, 0, 0, out.width, out.height);
+    return out;
+  }
+
+  // Counts the words in the brown name text by looking for wide gaps. Returns 0 when the text is too small to trust.
+  function countWords(c) {
+    var w = c.width;
+    var h = c.height;
+    var d = c.getContext('2d').getImageData(0, 0, w, h).data;
+    var rowHas = new Uint8Array(h);
+    var colHas = new Uint8Array(w);
+    for (var y = 0; y < h; y++) {
+      for (var x = 0; x < w; x++) {
+        var i = (y * w + x) * 4;
+        var r = d[i];
+        var g = d[i + 1];
+        var b = d[i + 2];
+        if (r > 70 && r - b > 45 && r - g > 20 && g < 130) {
+          rowHas[y] = 1;
+          colHas[x] = 1;
+        }
+      }
+    }
+    var top = -1;
+    var bottom = -1;
+    for (var yy = 0; yy < h; yy++) {
+      if (rowHas[yy]) {
+        if (top < 0) top = yy;
+        bottom = yy;
+      }
+    }
+    if (top < 0) return 0;
+    var textH = bottom - top + 1;
+    if (textH < 24) return 0;
+    var gapMin = Math.max(3, 0.2 * textH);
+    var words = 0;
+    var gap = 0;
+    var started = false;
+    for (var xx = 0; xx < w; xx++) {
+      if (colHas[xx]) {
+        if (!started) {
+          started = true;
+          words = 1;
+        } else if (gap >= gapMin) {
+          words++;
+        }
+        gap = 0;
+      } else if (started) {
+        gap++;
+      }
+    }
+    return words;
+  }
+
+  function cleanName(text) {
+    var t = String(text || '').replace(/[\r\n]+/g, ' ').replace(/[^A-Za-z .\-]/g, ' ');
+    t = t.replace(/\s+/g, ' ').replace(/^[^A-Za-z]+/, '').replace(/[^A-Za-z]+$/, '');
+    return /[A-Za-z]{2}/.test(t) ? t : '';
+  }
+
+  function cleanScore(text) {
+    var digits = String(text || '').replace(/[^0-9]/g, '');
+    if (digits.length < 3 || digits.length > 6) return '';
+    return Number(digits).toLocaleString('en-US');
+  }
+
+  // Most common answer. Ties go to the longer one. Optionally prefers answers with the expected word count.
+  function vote(list, words) {
+    var pool = list.filter(Boolean);
+    if (words > 0) {
+      var fit = pool.filter(function (t) { return t.split(' ').length === words; });
+      if (fit.length) pool = fit;
+    }
+    var counts = {};
+    pool.forEach(function (t) { counts[t] = (counts[t] || 0) + 1; });
+    var best = '';
+    var bestN = 0;
+    Object.keys(counts).forEach(function (t) {
+      if (counts[t] > bestN || (counts[t] === bestN && t.length > best.length)) {
+        best = t;
+        bestN = counts[t];
+      }
+    });
+    return best;
+  }
+
+  var NAME_SCALES = [0.7, 0.75, 0.8, 0.85, 0.9, 1.0, 1.1, 1.2];
+  var SCORE_SCALES = [0.9, 1.0, 1.1];
+
+  // Returns { name, score, label }. toInput converts a canvas for the OCR engine (default: the canvas itself).
+  async function read(src, top, makeCanvas, toInput) {
+    var T = await loadTesseract();
+    var worker = await T.createWorker('eng');
+    var feed = toInput || function (c) { return c; };
+    try {
+      var out = { name: '', score: '' };
+      var base = 1075 / src.width;
+      var nameC = cropRegion(src, top, REGIONS.name, makeCanvas);
+      if (nameC) {
+        await worker.setParameters({
+          tessedit_pageseg_mode: '7',
+          tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz .-'
+        });
+        var words = countWords(nameC);
+        var found = [];
+        for (var i = 0; i < NAME_SCALES.length; i++) {
+          var res = await worker.recognize(feed(scaled(nameC, base * NAME_SCALES[i], makeCanvas)));
+          found.push(cleanName(res.data.text));
+        }
+        out.name = vote(found, words);
+      }
+      var scoreC = cropRegion(src, top, REGIONS.score, makeCanvas);
+      if (scoreC) {
+        await worker.setParameters({
+          tessedit_pageseg_mode: '7',
+          tessedit_char_whitelist: '0123456789,'
+        });
+        var scores = [];
+        for (var k = 0; k < SCORE_SCALES.length; k++) {
+          var r2 = await worker.recognize(feed(scaled(scoreC, base * SCORE_SCALES[k], makeCanvas)));
+          scores.push(cleanScore(r2.data.text));
+        }
+        out.score = vote(scores, 0);
+      }
+      out.label = [out.name, out.score].filter(Boolean).join(' ');
+      return out;
+    } finally {
+      try {
+        await worker.terminate();
+      } catch (e) {}
+    }
+  }
+
+  function safeFileName(text) {
+    var t = String(text || '').replace(/[\\\/:*?"<>|\u0000-\u001f]/g, ' ').replace(/\s+/g, ' ').trim();
+    t = t.replace(/[. ]+$/, '');
+    if (t.length > 100) t = t.slice(0, 100).trim();
+    return t;
+  }
+
+  return { read: read, cleanName: cleanName, cleanScore: cleanScore, safeFileName: safeFileName, regions: REGIONS };
+})();
+
+if (typeof module !== 'undefined' && module.exports) module.exports = Namer;
+
+</script>
+<script>
 (function () {
   var CANCEL = { cancelled: true };
   var sources = [];
@@ -674,6 +965,7 @@ if (typeof module !== 'undefined' && module.exports) module.exports = Example;
   var blobUrl = null;
   var downloads = null;
   var exampleActive = false;
+  var fnameEdited = false;
 
   function $(id) {
     return document.getElementById(id);
@@ -684,8 +976,11 @@ if (typeof module !== 'undefined' && module.exports) module.exports = Example;
     strip: $('strip'),
     stripEmpty: $('strip-empty'),
     optFrame: $('opt-frame'),
+    optCrop: $('opt-crop'),
     optScroll: $('opt-scroll'),
     optSeams: $('opt-seams'),
+    fname: $('fname'),
+    fnameNote: $('fname-note'),
     save: $('save'),
     share: $('share'),
     status: $('status'),
@@ -882,6 +1177,7 @@ if (typeof module !== 'undefined' && module.exports) module.exports = Example;
       analysis = an;
       renderStrip();
       await render(my, prefix);
+      autoName(my);
     } catch (e) {
       if (e === CANCEL) return;
       clearResult();
@@ -903,7 +1199,7 @@ if (typeof module !== 'undefined' && module.exports) module.exports = Example;
     var out = Stitch.compose(
       comps,
       analysis,
-      { keepFrame: els.optFrame.checked, cleanScrollbar: els.optScroll.checked },
+      { keepFrame: els.optFrame.checked, cleanScrollbar: els.optScroll.checked, autoCrop: els.optCrop.checked },
       makeCanvas
     );
     var b = await new Promise(function (resolve) {
@@ -948,6 +1244,10 @@ if (typeof module !== 'undefined' && module.exports) module.exports = Example;
     var lost = analysis.skipped.length - dups;
     if (dups) notes.push(plural(dups, 'duplicate') + ' left out.');
     if (lost) notes.push(plural(lost, 'screenshot') + ' left out because it did not overlap the others.');
+    if (els.optCrop.checked && out.crop) {
+      if (out.crop.found) notes.push('Auto-cropped the top above the title bar and the bottom below the last item.');
+      else notes.push('Auto-crop found no green title bar, so nothing was cropped.');
+    }
     if (out.gap) notes.push('Some content between two shots is missing. Scroll less between shots.');
     setStatus(notes.join(' '), out.gap || lost > 0);
   }
@@ -1022,14 +1322,57 @@ if (typeof module !== 'undefined' && module.exports) module.exports = Example;
     setStatus('Add screenshots to begin.');
   });
 
-  [els.optFrame, els.optScroll, els.optSeams].forEach(function (el) {
+  [els.optFrame, els.optCrop, els.optScroll, els.optSeams].forEach(function (el) {
     el.addEventListener('change', function () {
       if (analysis) render(token);
     });
   });
 
+  function currentFile() {
+    return (Namer.safeFileName(els.fname.value) || 'stitched') + '.png';
+  }
+
+  function setNameNote(text) {
+    els.fnameNote.textContent = text;
+    els.fnameNote.hidden = !text;
+  }
+
+  els.fname.addEventListener('input', function () {
+    fnameEdited = true;
+    setNameNote('');
+  });
+
+  // Reads the character name and score from the dialog header and uses them as the file name.
+  async function autoName(my) {
+    if (!analysis || !norm) return;
+    var first = norm.canvases[analysis.order[0]];
+    var top = Stitch.findTitleTop(first, analysis.vt);
+    if (top < 0) {
+      if (!fnameEdited) els.fname.value = 'stitched';
+      setNameNote('');
+      return;
+    }
+    if (fnameEdited) return;
+    setNameNote('Reading the name and score from the screenshot');
+    try {
+      var found = await Namer.read(first, top, makeCanvas);
+      if (my !== token || fnameEdited) return;
+      if (found.label) {
+        els.fname.value = found.label;
+        setNameNote(found.name && found.score ? 'Named from the screenshot. Check it before saving.' : 'Only part of the name could be read. Check it before saving.');
+      } else {
+        els.fname.value = 'stitched';
+        setNameNote('Could not read the name or score. Type a file name if you want one.');
+      }
+    } catch (e) {
+      if (my !== token || fnameEdited) return;
+      els.fname.value = 'stitched';
+      setNameNote('Could not read the name. It needs an internet connection the first time. Type a file name if you want one.');
+    }
+  }
+
   function pngFile() {
-    return new File([blob], 'stitched.png', { type: 'image/png' });
+    return new File([blob], currentFile(), { type: 'image/png' });
   }
 
   function canShareFile() {
@@ -1044,7 +1387,7 @@ if (typeof module !== 'undefined' && module.exports) module.exports = Example;
   function browserDownload() {
     var a = document.createElement('a');
     a.href = blobUrl;
-    a.download = 'stitched.png';
+    a.download = currentFile();
     document.body.appendChild(a);
     a.click();
     a.remove();
@@ -1055,8 +1398,9 @@ if (typeof module !== 'undefined' && module.exports) module.exports = Example;
     if (!blob) return;
     if (downloads) {
       try {
-        await downloads.save({ filename: 'stitched.png', data: blob });
-        setStatus('Saved stitched.png.');
+        var fileName = currentFile();
+        await downloads.save({ filename: fileName, data: blob });
+        setStatus('Saved ' + fileName + '.');
         return;
       } catch (e) {
         if (e && e.code === 'declined') {
